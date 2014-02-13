@@ -46,6 +46,24 @@ class MailHandler < ActionMailer::Base
     super(email)
   end
 
+  # extract cid to filename map (hash) from email_body
+  def cid_filename_dict(email)
+    h = {}
+    cid = filename = nil
+
+    email.split(/\n/).each do |s|
+      if /filename=/ =~ s
+        filename = s.slice(/filename=\"(.*)\"/, 1)
+      elsif /^Content-ID/ =~ s
+        cid = s.slice(/<(.*)>/, 1)
+      elsif /^\s*$/ =~ s
+        h[cid] = filename if cid
+      end
+    end
+
+    h
+  end
+
   def logger
     Rails.logger
   end
@@ -176,12 +194,15 @@ class MailHandler < ActionMailer::Base
     if issue.subject.blank?
       issue.subject = '(no subject)'
     end
-    issue.description = cleaned_up_text_body
-
     # add To and Cc as watchers before saving so the watchers can reply to Redmine
     add_watchers(issue)
-    issue.save!
     add_attachments(issue)
+
+    desc = replace_src(cleaned_up_text_body, issue.attachments)
+
+    issue.description = desc
+    issue.save!
+
     logger.info "MailHandler: issue ##{issue.id} created by #{user}" if logger && logger.info
     issue
   end
@@ -208,8 +229,8 @@ class MailHandler < ActionMailer::Base
     end
     issue.safe_attributes = issue_attributes_from_keywords(issue)
     issue.safe_attributes = {'custom_field_values' => custom_field_values_from_keywords(issue)}
-    journal.notes = cleaned_up_text_body
     add_attachments(issue)
+    journal.notes = replace_src(cleaned_up_text_body, issue.attachments)
     issue.save!
     if logger && logger.info
       logger.info "MailHandler: issue ##{issue.id} updated by #{user}"
@@ -237,11 +258,12 @@ class MailHandler < ActionMailer::Base
 
       if !message.locked?
         reply = Message.new(:subject => cleaned_up_subject.gsub(%r{^.*msg\d+\]}, '').strip,
-                            :content => cleaned_up_text_body)
+                            :content => '') # cleaned_up_text_body
         reply.author = user
         reply.board = message.board
-        message.children << reply
         add_attachments(reply)
+        reply.content = replace_src(cleaned_up_text_body, reply.attachments)
+        message.children << reply
         reply
       else
         if logger && logger.info
@@ -359,18 +381,68 @@ class MailHandler < ActionMailer::Base
     end
   end
 
-  # Returns the text/plain part of the email
-  # If not found (eg. HTML-only email), returns the body with tags removed
+  # Despite of the name, it returns the HTML part of the email.
+  # IF not found, returns plain text part with <br /> tags added.
   def plain_text_body
     return @plain_text_body unless @plain_text_body.nil?
 
-    part = email.text_part || email.html_part || email
-    @plain_text_body = Redmine::CodesetUtil.to_utf8(part.body.decoded, part.charset)
+    if email.html_part
+      part = email.html_part
+      @plain_text_body = Redmine::CodesetUtil.to_utf8(part.body.decoded, part.charset)
+    else 
+      part = email.text_part || email
+      @plain_text_body = Redmine::CodesetUtil.to_utf8(part.body.decoded, part.charset)
+      @plain_text_body = @plain_text_body.gsub(/\n/, "<br />")
+    end
 
-    # strip html tags and remove doctype directive
-    @plain_text_body = strip_tags(@plain_text_body.strip)
+    # Remove doctype directive and remove unnecessary tags
     @plain_text_body.sub! %r{^<!DOCTYPE .*$}, ''
+    @plain_text_body = refine_html(@plain_text_body)
     @plain_text_body
+  end
+
+  def replace_src(s, attachments)
+    logger.info "s = #{s}"
+
+    s.gsub(/cid:[^\"]*/) do |m|
+      cid = m.slice(/cid:(.*)/, 1)
+      fname = cid_filename_dict(email.body.decoded)[cid]
+      n = nil
+      attachments.each do |a|
+        if a.filename == fname
+          n = a.id
+        end
+      end
+
+      logger.info "m = #{m}"
+      logger.info "cid = #{cid}, fname=#{fname}, n=#{n}"
+
+      "../attachments/download/#{n}/#{fname}"
+    end
+  end
+
+  def good_tag?(tag)
+    (tag == "p") or (tag == "br") or (tag == "b") or (tag == "hr") or (tag == "img") or (/h\d/ =~ tag)
+  end
+
+  def refine_html(body)
+    # step1: remove unnecessary tags
+    re = %r!</?\w+[^>]*>!
+
+    s = body.gsub(re) do |match|
+      tag = match.slice(%r!</?(\w+)!, 1)
+      if good_tag?(tag)
+        match.gsub(/=\n/, '') # remove newline
+      else
+        ''
+      end
+    end
+
+    # step2: remove comments
+    re = /<\!--.*?-->/m
+    s = s.gsub(re, '')
+    
+    s
   end
 
   def cleaned_up_text_body
@@ -464,6 +536,7 @@ class MailHandler < ActionMailer::Base
       regex = Regexp.new("^[> ]*(#{ delimiters.join('|') })\s*[\r\n].*", Regexp::MULTILINE)
       body = body.gsub(regex, '')
     end
+
     body.strip
   end
 
